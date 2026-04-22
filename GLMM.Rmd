@@ -1,0 +1,554 @@
+---
+title: "GLM Analysis (Trial-Level) — MST"
+author: "Abhishek Garimella"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lme4)
+library(lmerTest)     # Satterthwaite p-values for mixed models
+library(emmeans)      # post-hoc contrasts (Tukey / Bonferroni)
+library(parameters)   # model_parameters(): clean CI + p tables
+library(effectsize)   # Cohen's d, eta-squared
+library(performance)  # check_model() diagnostics
+library(pwr)          # post-hoc power analysis
+```
+
+---
+
+## 1. Configuration
+
+```{r config}
+GROUP_FOLDERS <- list(
+  "Task-Only"  = "./MST_Data/task_only/task_only_data",
+  "Both"       = "./MST_Data/Both_item_task/both_data",
+  "Item-Only"  = "./MST_Data/item_only/item_only_data"
+)
+
+BIN_FILE <- "./MST_Data/Both_item_task/Set6 bins.txt"
+```
+
+---
+
+## 2. Data Loading & Parsing
+
+```{r load-data}
+classify_image <- function(path) {
+  path <- gsub("\\\\", "/", path)
+  bn   <- tolower(basename(path))
+  if (grepl("foil", tolower(path)))    return("Foil")
+  if (grepl("a\\.jpg$", bn))           return("Target")
+  if (grepl("b\\.jpg$", bn))           return("Lure")
+  return(NA_character_)
+}
+
+parse_task <- function(filepath, group) {
+  df   <- read_csv(filepath, show_col_types = FALSE)
+  main <- if ("trials.thisN" %in% names(df)) filter(df, !is.na(`trials.thisN`)) else df
+  if (nrow(main) == 0) return(NULL)
+  pid  <- substr(basename(filepath), 1, 5)
+  acc  <- if ("encoding_task_accuracy" %in% names(main))
+            mean(main$encoding_task_accuracy, na.rm = TRUE) else NA_real_
+  tibble(participant = pid, enc_accuracy = acc, group = group)
+}
+
+parse_test <- function(filepath, group) {
+  df     <- read_csv(filepath, show_col_types = FALSE)
+  trials <- if ("trials.thisN" %in% names(df)) filter(df, !is.na(`trials.thisN`)) else df
+  needed <- c("image_path", "position_of_stimuli",
+              "trials.key_resp_3.keys", "trials.key_resp_3.rt")
+  if (!all(needed %in% names(trials)) || nrow(trials) == 0) return(NULL)
+  pid <- substr(basename(filepath), 1, 5)
+  trials %>%
+    select(all_of(needed)) %>%
+    rename(image_path = 1, position = 2, response = 3, rt = 4) %>%
+    mutate(
+      participant = pid,
+      group       = group,
+      img_type    = map_chr(image_path, classify_image),
+      position    = tolower(replace_na(as.character(position), "none")),
+      image_id    = basename(image_path)
+    )
+}
+
+all_task <- list()
+all_test <- list()
+
+for (grp in names(GROUP_FOLDERS)) {
+  folder <- GROUP_FOLDERS[[grp]]
+  files  <- sort(list.files(folder, pattern = "\\.csv$", full.names = TRUE))
+  task_files <- files[grepl("_task_", basename(files))]
+  test_files <- files[grepl("_test_", basename(files))]
+  task_ids   <- setNames(task_files, substr(basename(task_files), 1, 5))
+  test_ids   <- setNames(test_files, substr(basename(test_files), 1, 5))
+  valid_ids  <- intersect(names(task_ids), names(test_ids))
+  cat(grp, ": paired participants =", length(valid_ids), "\n")
+  for (pid in valid_ids) {
+    t  <- try(parse_task(task_ids[pid], grp), silent = TRUE)
+    te <- try(parse_test(test_ids[pid], grp), silent = TRUE)
+    if (!inherits(t,  "try-error") && !is.null(t))  all_task[[length(all_task)+1]]  <- t
+    if (!inherits(te, "try-error") && !is.null(te)) all_test[[length(all_test)+1]]  <- te
+  }
+}
+
+task_info   <- bind_rows(all_task)
+test_trials <- bind_rows(all_test)
+cat("Task participants parsed:", n_distinct(task_info$participant), "\n")
+cat("Test participants parsed:", n_distinct(test_trials$participant), "\n")
+```
+
+---
+
+## 3. Preprocessing, Exclusions & Feature Engineering
+
+```{r preprocess}
+test_trials <- test_trials %>%
+  inner_join(task_info, by = c("participant", "group"))
+
+before <- n_distinct(test_trials$participant)
+
+# --- Exclusion 1: low encoding accuracy (uncomment to enable) ---
+# valid_pids <- task_info %>% filter(enc_accuracy >= 0.60) %>% pull(participant)
+# test_trials <- filter(test_trials, participant %in% valid_pids)
+
+# --- Exclusion 2: high foil false-alarm rate > 0.50 (uncomment to enable) ---
+# foil_far <- test_trials %>%
+#   filter(img_type == "Foil") %>%
+#   group_by(participant) %>%
+#   summarise(far = mean(tolower(response) == "o", na.rm = TRUE))
+# valid_pids2 <- foil_far %>% filter(far <= 0.50) %>% pull(participant)
+# test_trials <- filter(test_trials, participant %in% valid_pids2)
+
+after <- n_distinct(test_trials$participant)
+cat("Excluded", before - after, "participants | Remaining:", after, "\n")
+
+# Binary outcomes
+test_trials <- test_trials %>%
+  mutate(
+    resp_old     = as.integer(tolower(response) == "o"),
+    resp_similar = as.integer(tolower(response) == "s"),
+    # Dummy codes: reference = Mid position, reference group = Item-Only
+    pos_post  = as.integer(position == "post"),
+    pos_pre   = as.integer(position == "pre"),
+    grp_task  = as.integer(group == "Task-Only"),
+    grp_both  = as.integer(group == "Both"),
+    # Factor versions for emmeans
+    Position  = factor(position, levels = c("mid", "pre", "post")),
+    Condition = factor(group, levels = c("Item-Only", "Task-Only", "Both")),
+    participant = factor(participant),
+    image_id    = factor(image_id)
+  )
+
+# Lure similarity bins (1–5) from external mapping file
+test_trials <- test_trials %>%
+  mutate(
+    stim_num    = as.numeric(str_extract(gsub("\\\\", "/", image_path), "(\\d+)[ab]\\.jpg", group = 1)),
+    stim_idx120 = ((stim_num - 1) %% 120) + 1
+  )
+
+if (file.exists(BIN_FILE)) {
+  bin_lookup <- read_table(BIN_FILE, col_names = c("stim_idx120", "bin"), col_types = "ii")
+  test_trials <- left_join(test_trials, bin_lookup, by = "stim_idx120")
+} else {
+  warning(paste("Bin file not found:", BIN_FILE, "— using stim_idx120 as fallback."))
+  test_trials$bin <- test_trials$stim_idx120
+}
+
+test_trials$bin <- as.integer(test_trials$bin)
+cat("Rows available for modeling:", nrow(test_trials), "\n")
+cat("Non-null bin rows:", sum(!is.na(test_trials$bin)), "\n")
+```
+
+---
+
+## 4. GLMM — REC (Binomial, logit link)
+
+Predicts trial-level `resp_old` (0/1): Position (post/pre vs mid) × Group,
+with random intercepts for participant and image.
+
+```{r glmm-rec}
+rec_data <- test_trials %>%
+  filter(img_type %in% c("Target", "Foil")) %>%
+  drop_na(resp_old)
+
+# Formula mirrors Python: pos_post*grp_task + pos_post*grp_both + pos_pre*grp_task + pos_pre*grp_both
+glmm_rec <- glmer(
+  resp_old ~ pos_post * grp_task + pos_post * grp_both +
+             pos_pre  * grp_task + pos_pre  * grp_both +
+             (1 | participant) + (1 | image_id),
+  data    = rec_data,
+  family  = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+summary(glmm_rec)
+```
+
+```{r glmm-rec-table}
+# Full fixed-effects table: beta (log-OR), SE, z, p, 95% CI (Wald), OR
+cat("\n--- Fixed Effects: log-OR scale ---\n")
+model_parameters(glmm_rec, exponentiate = FALSE, ci = 0.95) %>% print()
+
+cat("\n--- Fixed Effects: Odds Ratio scale ---\n")
+model_parameters(glmm_rec, exponentiate = TRUE,  ci = 0.95) %>% print()
+```
+
+
+```{r save-glmm-rec}
+# Save REC fixed effects with requested columns
+rec_coef <- as.data.frame(summary(glmm_rec)$coefficients)
+rec_coef$term <- rownames(rec_coef)
+rownames(rec_coef) <- NULL
+
+rec_ci <- as.data.frame(confint(glmm_rec, method = "Wald", level = 0.95))
+rec_ci$term <- rownames(rec_ci)
+rownames(rec_ci) <- NULL
+rec_ci <- rec_ci %>%
+  filter(term %in% rec_coef$term) %>%
+  select(term, `2.5 %`, `97.5 %`)
+
+rec_out <- rec_coef %>%
+  left_join(rec_ci, by = "term") %>%
+  transmute(
+    term,
+    `log odds` = Estimate,
+    `SE_log odds` = `Std. Error`,
+    `95%CI_logodds` = sprintf("[%.6f, %.6f]", `2.5 %`, `97.5 %`),
+    `odds ratio` = exp(Estimate),
+    `SE_OR` = exp(Estimate) * `Std. Error`,
+    `95%CI_oR` = sprintf("[%.6f, %.6f]", exp(`2.5 %`), exp(`97.5 %`)),
+    z = `z value`,
+    p = `Pr(>|z|)`
+  )
+
+write_csv(rec_out, "./GLMM_REC.csv")
+cat("Saved: GLMM_REC.csv\n")
+
+# Save REC random effects: Groups, Name, Variance, Std.Dev
+rec_randeff <- as.data.frame(VarCorr(glmm_rec)) %>%
+  transmute(
+    Groups = grp,
+    Name = if_else(is.na(var1), "(Intercept)", var1),
+    Variance = vcov,
+    `Std.Dev` = sdcor
+  )
+
+write_csv(rec_randeff, "./GLMM_RandEff_REC.csv")
+cat("Saved: GLMM_RandEff_REC.csv\n")
+```
+
+---
+
+## 5. Post-hoc Contrasts — REC (Tukey's HSD + Bonferroni)
+
+Runs because REC gave a significant result in the Python notebook.
+
+```{r posthoc-rec}
+# EMMs on the dummy-coded model — refit using factor columns for cleaner emmeans output
+glmm_rec_fac <- glmer(
+  resp_old ~ Position * Condition + (1 | participant) + (1 | image_id),
+  data    = rec_data,
+  family  = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+emm_rec <- emmeans(glmm_rec_fac, ~ Position | Condition)
+
+cat("\n--- Tukey HSD: pairwise Position contrasts within each Condition ---\n")
+pairs(emm_rec, adjust = "tukey") %>% as_tibble() %>% arrange(Condition, p.value) %>% print()
+
+cat("\n--- Bonferroni: Post vs Mid contrast per Condition ---\n")
+contrast(emm_rec, method = list("Post-Mid" = c(-1, 0, 1)), adjust = "bonferroni") %>%
+  as_tibble() %>% print()
+```
+
+```{r save-posthoc-rec}
+# Save REC post-hoc contrasts with requested columns
+posthoc_tukey <- pairs(emm_rec, adjust = "tukey") %>%
+  as_tibble() %>%
+  mutate(
+    correction = "tukey",
+    `cohen's d` = estimate / SE
+  ) %>%
+  transmute(
+    correction,
+    contrast,
+    condition = Condition,
+    estimate,
+    SE,
+    df,
+    z.ratio,
+    p.value,
+    `cohen's d`
+  )
+
+posthoc_bonf <- contrast(emm_rec, method = list("Post-Mid" = c(-1, 0, 1)), adjust = "bonferroni") %>%
+  as_tibble() %>%
+  mutate(
+    correction = "bonferroni",
+    `cohen's d` = estimate / SE
+  ) %>%
+  transmute(
+    correction,
+    contrast,
+    condition = Condition,
+    estimate,
+    SE,
+    df,
+    z.ratio,
+    p.value,
+    `cohen's d`
+  )
+
+posthoc_out <- bind_rows(posthoc_tukey, posthoc_bonf)
+write_csv(posthoc_out, "./GLMM_PostHoc_REC.csv")
+cat("Saved: GLMM_PostHoc_REC.csv\n")
+```
+
+---
+
+## 6. GLMM — LDI (Binomial, logit link, with Similarity Bins)
+
+Predicts trial-level `resp_similar` (0/1): pre-boundary × group interactions,
+similarity bin main effect, and Position × Bin interaction.
+
+```{r glmm-ldi}
+ldi_data <- test_trials %>%
+  filter(img_type %in% c("Lure", "Foil")) %>%
+  drop_na(resp_similar, bin)
+
+# Formula mirrors Python exactly
+glmm_ldi <- glmer(
+  resp_similar ~ pos_pre * grp_task + pos_pre * grp_both +
+                 factor(bin) + pos_pre:factor(bin) +
+                 (1 | participant) + (1 | image_id),
+  data    = ldi_data,
+  family  = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+summary(glmm_ldi)
+```
+
+```{r glmm-ldi-table}
+cat("\n--- Fixed Effects: log-OR scale ---\n")
+model_parameters(glmm_ldi, exponentiate = FALSE, ci = 0.95) %>% print()
+
+cat("\n--- Fixed Effects: Odds Ratio scale ---\n")
+model_parameters(glmm_ldi, exponentiate = TRUE,  ci = 0.95) %>% print()
+```
+
+```{r save-glmm-ldi}
+# Save LDI fixed effects with requested columns
+ldi_coef <- as.data.frame(summary(glmm_ldi)$coefficients)
+ldi_coef$term <- rownames(ldi_coef)
+rownames(ldi_coef) <- NULL
+
+ldi_ci <- as.data.frame(confint(glmm_ldi, method = "Wald", level = 0.95))
+ldi_ci$term <- rownames(ldi_ci)
+rownames(ldi_ci) <- NULL
+ldi_ci <- ldi_ci %>%
+  filter(term %in% ldi_coef$term) %>%
+  select(term, `2.5 %`, `97.5 %`)
+
+ldi_out <- ldi_coef %>%
+  left_join(ldi_ci, by = "term") %>%
+  transmute(
+    term,
+    `log odds` = Estimate,
+    `SE_log odds` = `Std. Error`,
+    `95%CI_logodds` = sprintf("[%.6f, %.6f]", `2.5 %`, `97.5 %`),
+    `odds ratio` = exp(Estimate),
+    `SE_OR` = exp(Estimate) * `Std. Error`,
+    `95%CI_oR` = sprintf("[%.6f, %.6f]", exp(`2.5 %`), exp(`97.5 %`)),
+    z = `z value`,
+    p = `Pr(>|z|)`
+  )
+
+write_csv(ldi_out, "./GLMM_LDI.csv")
+cat("Saved: GLMM_LDI.csv\n")
+```
+
+```{r glmm-ldi-bin-interaction}
+# Inspect Position × Bin interaction: does pre-boundary effect vary by bin?
+glmm_ldi_fac <- glmer(
+  resp_similar ~ pos_pre * Condition + factor(bin) + pos_pre:factor(bin) +
+                 (1 | participant) + (1 | image_id),
+  data    = ldi_data,
+  family  = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+emm_ldi_bin <- emmeans(glmm_ldi_fac, ~ pos_pre | bin)
+cat("\n--- Position (Pre vs Mid) contrast at each similarity bin ---\n")
+pairs(emm_ldi_bin, adjust = "tukey") %>% as_tibble() %>% arrange(bin) %>% print()
+```
+
+
+---
+
+## 7. GLM — RT Slowing → REC Deficit (Participant-Level Regression)
+
+Replicates the OLS regression from cell 5 of the Python notebook.
+
+```{r rt-delta}
+# Parse encoding RT per participant (median Post-RT minus median Mid-RT)
+get_rt_delta <- function(filepath) {
+  df   <- read_csv(filepath, show_col_types = FALSE)
+  main <- if ("trials.thisN" %in% names(df)) filter(df, !is.na(`trials.thisN`)) else df
+  if (nrow(main) == 0) return(NULL)
+  pid <- substr(basename(filepath), 1, 5)
+  main <- main %>%
+    mutate(pos_idx = as.integer(`trials.thisN`) %% 7,
+           pos     = case_when(pos_idx == 0 ~ "post", pos_idx == 6 ~ "pre", TRUE ~ "mid"))
+  rt_candidates <- intersect(c("trials.key_resp_8.rt", "trials.key_resp_9.rt"), names(main))
+  if (length(rt_candidates) == 0) return(NULL)
+  rt_candidates <- rt_candidates[sapply(rt_candidates, function(x) {
+    vals <- suppressWarnings(as.numeric(main[[x]]))
+    any(!is.na(vals))
+  })]
+  if (length(rt_candidates) == 0) return(NULL)
+  rt_col <- rt_candidates[1]
+  rt_by_pos <- main %>%
+    mutate(rt_value = suppressWarnings(as.numeric(.data[[rt_col]]))) %>%
+    group_by(pos) %>%
+    summarise(med_rt = median(rt_value, na.rm = TRUE), .groups = "drop")
+  mid_rt  <- rt_by_pos$med_rt[rt_by_pos$pos == "mid"]
+  post_rt <- rt_by_pos$med_rt[rt_by_pos$pos == "post"]
+  if (length(mid_rt) == 0 || length(post_rt) == 0) return(NULL)
+  tibble(participant = pid, rt_delta_post = post_rt - mid_rt)
+}
+
+task_files_rt <- unlist(lapply(GROUP_FOLDERS, function(f)
+  sort(list.files(f, pattern = "_MST_task_.*\\.csv$", full.names = TRUE))))
+
+rt_data <- bind_rows(lapply(task_files_rt, get_rt_delta))
+```
+
+```{r rec-agg}
+# Compute foil-corrected REC delta (Post − Mid) per participant
+foil_far_df <- test_trials %>%
+  filter(img_type == "Foil") %>%
+  group_by(participant) %>%
+  summarise(foil_far = mean(resp_old, na.rm = TRUE))
+
+rec_agg <- test_trials %>%
+  filter(img_type == "Target") %>%
+  group_by(participant, position) %>%
+  summarise(hit_rate = mean(resp_old, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = position, values_from = hit_rate) %>%
+  left_join(foil_far_df, by = "participant") %>%
+  mutate(
+    REC_post  = post - foil_far,
+    REC_mid   = mid  - foil_far,
+    REC_delta_post = REC_post - REC_mid
+  ) %>%
+  select(participant, REC_delta_post)
+```
+
+```{r glm-rt-rec}
+reg_data <- rt_data %>%
+  inner_join(rec_agg, by = "participant") %>%
+  left_join(distinct(task_info, participant, group), by = "participant") %>%
+  drop_na(rt_delta_post, REC_delta_post)
+
+cat("N for regression:", nrow(reg_data), "\n")
+
+glm_rt <- lm(REC_delta_post ~ rt_delta_post + factor(group), data = reg_data)
+summary(glm_rt)
+```
+
+```{r glm-rt-table}
+# Full table with beta, SE, t, p, 95% CI
+cat("\n--- Fixed Effects with 95% CIs ---\n")
+model_parameters(glm_rt, ci = 0.95) %>% print()
+```
+
+```{r glm-rt-correlation}
+# Overall Pearson r (mirrors Python output)
+ct <- cor.test(reg_data$rt_delta_post, reg_data$REC_delta_post)
+cat(sprintf("\nOverall Pearson r (RT slowing vs REC deficit): r=%.3f, p=%.3f\n", ct$estimate, ct$p.value))
+cat("95% CI: [", round(ct$conf.int, 3), ",", round(ct$conf.int, 3), "]\n")[2][1]
+```
+
+```{r save-rt-rec}
+# Save RT -> REC regression summary with requested columns
+rt_coef <- as.data.frame(summary(glm_rt)$coefficients)
+rt_coef$Parameter <- rownames(rt_coef)
+rownames(rt_coef) <- NULL
+
+rt_ci <- as.data.frame(confint(glm_rt, level = 0.95))
+rt_ci$Parameter <- rownames(rt_ci)
+rownames(rt_ci) <- NULL
+rt_ci <- rt_ci %>% rename(ci_low = `2.5 %`, ci_high = `97.5 %`)
+
+rt_out <- rt_coef %>%
+  left_join(rt_ci, by = "Parameter") %>%
+  transmute(
+    Parameter,
+    Coefficient = Estimate,
+    SE = `Std. Error`,
+    `95% CI` = sprintf("[%.6f, %.6f]", ci_low, ci_high),
+    `t(338)` = `t value`,
+    p = `Pr(>|t|)`
+  )
+
+rt_corr_row <- tibble(
+  Parameter = sprintf("Overall Pearson r (RT slowing vs REC deficit): r=%.3f, p=%.2f", unname(ct$estimate), ct$p.value),
+  Coefficient = unname(ct$estimate),
+  SE = NA_real_,
+  `95% CI` = sprintf("[%.3f, %.3f]", ct$conf.int[1], ct$conf.int[2]),
+  `t(338)` = NA_real_,
+  p = ct$p.value
+)
+
+rt_out <- bind_rows(rt_out, rt_corr_row)
+write_csv(rt_out, "./RT_REC.csv")
+cat("Saved: RT_REC.csv\n")
+```
+
+
+---
+
+## 8. Effect Sizes
+
+```{r effect-sizes}
+# Eta-squared for RT → REC GLM
+cat("\n--- Eta-squared (partial) for RT regression ---\n")
+eta_squared(glm_rt, partial = TRUE) %>% print()
+
+# Cohen's d for REC post-hoc contrasts
+cat("\n--- Cohen's d for REC Position contrasts ---\n")
+eff_rec <- pairs(emm_rec, adjust = "none") %>%
+  as_tibble() %>%
+  mutate(cohens_d = estimate / SE)
+print(eff_rec)
+```
+
+---
+
+## 9. Post-hoc Power Analysis
+
+```{r power}
+# Minimum detectable effect at N=51 (smallest group: Both), alpha=0.05, power=0.80
+pwr.t.test(
+  n           = 51,
+  sig.level   = 0.05,
+  power       = 0.80,
+  type        = "one.sample",
+  alternative = "two.sided"
+)
+# The returned d is the smallest effect your study was powered to detect
+```
