@@ -16,6 +16,7 @@ output:
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
+library(performance)
 library(tidyverse)
 library(lme4)
 library(lmerTest)     # Satterthwaite p-values for mixed models
@@ -48,9 +49,9 @@ BIN_FILE <- "./MST_Data/Both_item_task/Set6 bins.txt"
 classify_image <- function(path) {
   path <- gsub("\\\\", "/", path)
   bn   <- tolower(basename(path))
-  if (grepl("foil", tolower(path)))    return("Foil")
-  if (grepl("a\\.jpg$", bn))           return("Target")
-  if (grepl("b\\.jpg$", bn))           return("Lure")
+  if (grepl("foil", tolower(path))) return("Foil")
+  if (grepl("a\\.jpg$", bn))        return("Target")
+  if (grepl("b\\.jpg$", bn))        return("Lure")
   return(NA_character_)
 }
 
@@ -61,7 +62,12 @@ parse_task <- function(filepath, group) {
   pid  <- substr(basename(filepath), 1, 5)
   acc  <- if ("encoding_task_accuracy" %in% names(main))
             mean(main$encoding_task_accuracy, na.rm = TRUE) else NA_real_
-  tibble(participant = pid, enc_accuracy = acc, group = group)
+  tibble(
+    participant = pid,
+    subject_id  = paste0(group, "_", pid),   # ← unique ID
+    enc_accuracy = acc,
+    group = group
+  )
 }
 
 parse_test <- function(filepath, group) {
@@ -76,6 +82,7 @@ parse_test <- function(filepath, group) {
     rename(image_path = 1, position = 2, response = 3, rt = 4) %>%
     mutate(
       participant = pid,
+      subject_id  = paste0(group, "_", pid),   # ← unique ID
       group       = group,
       img_type    = map_chr(image_path, classify_image),
       position    = tolower(replace_na(as.character(position), "none")),
@@ -87,8 +94,8 @@ all_task <- list()
 all_test <- list()
 
 for (grp in names(GROUP_FOLDERS)) {
-  folder <- GROUP_FOLDERS[[grp]]
-  files  <- sort(list.files(folder, pattern = "\\.csv$", full.names = TRUE))
+  folder     <- GROUP_FOLDERS[[grp]]
+  files      <- sort(list.files(folder, pattern = "\\.csv$", full.names = TRUE))
   task_files <- files[grepl("_task_", basename(files))]
   test_files <- files[grepl("_test_", basename(files))]
   task_ids   <- setNames(task_files, substr(basename(task_files), 1, 5))
@@ -105,8 +112,10 @@ for (grp in names(GROUP_FOLDERS)) {
 
 task_info   <- bind_rows(all_task)
 test_trials <- bind_rows(all_test)
-cat("Task participants parsed:", n_distinct(task_info$participant), "\n")
-cat("Test participants parsed:", n_distinct(test_trials$participant), "\n")
+
+# now correctly reports 158
+cat("Task participants parsed:", n_distinct(task_info$subject_id), "\n")
+cat("Test participants parsed:", n_distinct(test_trials$subject_id), "\n")
 ```
 
 ---
@@ -117,49 +126,56 @@ cat("Test participants parsed:", n_distinct(test_trials$participant), "\n")
 test_trials <- test_trials %>%
   inner_join(task_info, by = c("participant", "group"))
 
-before <- n_distinct(test_trials$participant)
+# ── FIX: create unique subject ID to prevent PID collision across groups ──
+test_trials <- test_trials %>%
+  mutate(subject_id = paste0(group, "_", participant))
+
+before <- n_distinct(test_trials$subject_id)
 
 # --- Exclusion 1: low encoding accuracy (uncomment to enable) ---
-# valid_pids <- task_info %>% filter(enc_accuracy >= 0.60) %>% pull(participant)
-# test_trials <- filter(test_trials, participant %in% valid_pids)
+# valid_sids <- test_trials %>%
+#   filter(enc_accuracy >= 0.60) %>%
+#   pull(subject_id) %>% unique()
+# test_trials <- filter(test_trials, subject_id %in% valid_sids)
 
 # --- Exclusion 2: high foil false-alarm rate > 0.50 (uncomment to enable) ---
 # foil_far <- test_trials %>%
 #   filter(img_type == "Foil") %>%
-#   group_by(participant) %>%
+#   group_by(subject_id) %>%
 #   summarise(far = mean(tolower(response) == "o", na.rm = TRUE))
-# valid_pids2 <- foil_far %>% filter(far <= 0.50) %>% pull(participant)
-# test_trials <- filter(test_trials, participant %in% valid_pids2)
+# valid_sids2 <- foil_far %>% filter(far <= 0.50) %>% pull(subject_id)
+# test_trials <- filter(test_trials, subject_id %in% valid_sids2)
 
-after <- n_distinct(test_trials$participant)
+after <- n_distinct(test_trials$subject_id)
 cat("Excluded", before - after, "participants | Remaining:", after, "\n")
+# should now print 158 instead of 72
 
 # Binary outcomes
 test_trials <- test_trials %>%
   mutate(
     resp_old     = as.integer(tolower(response) == "o"),
     resp_similar = as.integer(tolower(response) == "s"),
-    # Dummy codes: reference = Mid position, reference group = Item-Only
-    pos_post  = as.integer(position == "post"),
-    pos_pre   = as.integer(position == "pre"),
-    grp_task  = as.integer(group == "Task-Only"),
-    grp_both  = as.integer(group == "Both"),
-    # Factor versions for emmeans
-    Position  = factor(position, levels = c("mid", "pre", "post")),
-    Condition = factor(group, levels = c("Item-Only", "Task-Only", "Both")),
-    participant = factor(participant),
-    image_id    = factor(image_id)
+    pos_post     = as.integer(position == "post"),
+    pos_pre      = as.integer(position == "pre"),
+    grp_task     = as.integer(group == "Task-Only"),
+    grp_both     = as.integer(group == "Both"),
+    Position     = factor(position, levels = c("mid", "pre", "post")),
+    Condition    = factor(group,    levels = c("Item-Only", "Task-Only", "Both")),
+    subject_id   = factor(subject_id),   # factor for random effects
+    participant  = factor(participant),
+    image_id     = factor(image_id)
   )
 
 # Lure similarity bins (1–5) from external mapping file
 test_trials <- test_trials %>%
   mutate(
-    stim_num    = as.numeric(str_extract(gsub("\\\\", "/", image_path), "(\\d+)[ab]\\.jpg", group = 1)),
+    stim_num    = as.numeric(str_extract(gsub("\\\\", "/", image_path),
+                                         "(\\d+)[ab]\\.jpg", group = 1)),
     stim_idx120 = ((stim_num - 1) %% 120) + 1
   )
 
 if (file.exists(BIN_FILE)) {
-  bin_lookup <- read_table(BIN_FILE, col_names = c("stim_idx120", "bin"), col_types = "ii")
+  bin_lookup  <- read_table(BIN_FILE, col_names = c("stim_idx120", "bin"), col_types = "ii")
   test_trials <- left_join(test_trials, bin_lookup, by = "stim_idx120")
 } else {
   warning(paste("Bin file not found:", BIN_FILE, "— using stim_idx120 as fallback."))
@@ -168,7 +184,8 @@ if (file.exists(BIN_FILE)) {
 
 test_trials$bin <- as.integer(test_trials$bin)
 cat("Rows available for modeling:", nrow(test_trials), "\n")
-cat("Non-null bin rows:", sum(!is.na(test_trials$bin)), "\n")
+cat("Non-null bin rows:",           sum(!is.na(test_trials$bin)), "\n")
+cat("Unique subjects:",             n_distinct(test_trials$subject_id), "\n")  # verify = 158
 ```
 
 ---
@@ -187,7 +204,7 @@ rec_data <- test_trials %>%
 glmm_rec <- glmer(
   resp_old ~ pos_post * grp_task + pos_post * grp_both +
              pos_pre  * grp_task + pos_pre  * grp_both +
-             (1 | participant) + (1 | image_id),
+             (1 | subject_id) + (1 | image_id),
   data    = rec_data,
   family  = binomial(link = "logit"),
   control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
@@ -204,7 +221,62 @@ model_parameters(glmm_rec, exponentiate = FALSE, ci = 0.95) %>% print()
 cat("\n--- Fixed Effects: Odds Ratio scale ---\n")
 model_parameters(glmm_rec, exponentiate = TRUE,  ci = 0.95) %>% print()
 ```
+```{r}
+check_overdispersion(glmm_rec)
+check_collinearity(glmm_rec)
+```
 
+```{r}
+re_participant_rec <- ranef(glmm_rec)$subject_id[, 1]
+re_image_rec       <- ranef(glmm_rec)$image_id[, 1]
+
+# Q-Q plots for both
+par(mfrow = c(1, 2))
+qqnorm(re_participant_rec, main = "REC: Participant Random Intercepts")
+qqline(re_participant_rec, col = "red")
+
+qqnorm(re_image_rec, main = "REC: Image Random Intercepts")
+qqline(re_image_rec, col = "red")
+
+# Histograms
+p_re1 <- ggplot(data.frame(re = re_participant_rec), aes(x = re)) +
+  geom_histogram(bins = 15, fill = "#4C8BE0", colour = "white") +
+  labs(title = "REC: Participant Random Intercepts", x = "b_i") +
+  theme_minimal()
+
+p_re2 <- ggplot(data.frame(re = re_image_rec), aes(x = re)) +
+  geom_histogram(bins = 20, fill = "#E04C4C", colour = "white") +
+  labs(title = "REC: Image Random Intercepts", x = "b_j") +
+  theme_minimal()
+```
+```{r}
+library(lme4)
+
+# Pearson residuals
+rec_data$pearson_resid <- residuals(glmm_rec, type = "pearson")
+
+# Check if residuals correlate with trial order within participants
+rec_data %>%
+  group_by(subject_id) %>%
+  mutate(trial_order = row_number()) %>%
+  summarise(autocor = cor(pearson_resid, trial_order, use = "complete.obs")) %>%
+  summarise(mean_autocor = mean(autocor, na.rm = TRUE))
+```
+```{r}
+rec_data$obs_id <- seq_len(nrow(rec_data))
+
+glmm_rec_olre <- glmer(
+  resp_old ~ pos_post * grp_task + pos_post * grp_both +
+             pos_pre  * grp_task + pos_pre  * grp_both +
+             (1 | subject_id) + (1 | image_id) + (1 | obs_id),
+  data    = rec_data,
+  family  = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+
+# Compare with original
+anova(glmm_rec, glmm_rec_olre)
+```
 
 ```{r save-glmm-rec}
 # Save REC fixed effects with requested columns
@@ -258,7 +330,7 @@ Runs because REC gave a significant result in the Python notebook.
 ```{r posthoc-rec}
 # EMMs on the dummy-coded model — refit using factor columns for cleaner emmeans output
 glmm_rec_fac <- glmer(
-  resp_old ~ Position * Condition + (1 | participant) + (1 | image_id),
+  resp_old ~ Position * Condition + (1 | subject_id) + (1 | image_id),
   data    = rec_data,
   family  = binomial(link = "logit"),
   control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
@@ -333,7 +405,7 @@ ldi_data <- test_trials %>%
 glmm_ldi <- glmer(
   resp_similar ~ pos_pre * grp_task + pos_pre * grp_both +
                  factor(bin) + pos_pre:factor(bin) +
-                 (1 | participant) + (1 | image_id),
+                 (1 | subject_id) + (1 | image_id),
   data    = ldi_data,
   family  = binomial(link = "logit"),
   control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
@@ -348,6 +420,62 @@ model_parameters(glmm_ldi, exponentiate = FALSE, ci = 0.95) %>% print()
 
 cat("\n--- Fixed Effects: Odds Ratio scale ---\n")
 model_parameters(glmm_ldi, exponentiate = TRUE,  ci = 0.95) %>% print()
+```
+
+```{r}
+check_overdispersion(glmm_ldi)
+check_collinearity(glmm_ldi)
+```
+```{r}
+re_participant_ldi <- ranef(glmm_ldi)$subject_id[, 1]
+re_image_ldi       <- ranef(glmm_ldi)$image_id[, 1]
+
+# Q-Q plots for both
+par(mfrow = c(1, 2))
+qqnorm(re_participant_ldi, main = "LDI: Participant Random Intercepts")
+qqline(re_participant_ldi, col = "red")
+
+qqnorm(re_image_ldi, main = "LDI: Image Random Intercepts")
+qqline(re_image_ldi, col = "red")
+
+# Histograms
+p_re1 <- ggplot(data.frame(re = re_participant_ldi), aes(x = re)) +
+  geom_histogram(bins = 15, fill = "#4C8BE0", colour = "white") +
+  labs(title = "LDI: Participant Random Intercepts", x = "b_i") +
+  theme_minimal()
+
+p_re2 <- ggplot(data.frame(re = re_image_ldi), aes(x = re)) +
+  geom_histogram(bins = 20, fill = "#E04C4C", colour = "white") +
+  labs(title = "LDI: Image Random Intercepts", x = "b_j") +
+  theme_minimal()
+```
+
+
+```{r}
+library(lme4)
+
+# Pearson residuals
+ldi_data$pearson_resid <- residuals(glmm_ldi, type = "pearson")
+
+# Check if residuals correlate with trial order within participants
+ldi_data %>%
+  group_by(subject_id) %>%
+  mutate(trial_order = row_number()) %>%
+  summarise(autocor = cor(pearson_resid, trial_order, use = "complete.obs")) %>%
+  summarise(mean_autocor = mean(autocor, na.rm = TRUE))
+```
+```{r}
+ldi_data$obs_id <- seq_len(nrow(ldi_data))
+glmm_ldi_olre <- glmer(
+  resp_similar ~ pos_pre * grp_task + pos_pre * grp_both +
+                 factor(bin) + pos_pre:factor(bin) +
+                 (1 | subject_id) + (1 | image_id) + (1 | obs_id),
+  data    = ldi_data,
+  family  = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+)
+# Compare with original
+anova(glmm_ldi, glmm_ldi_olre)
 ```
 
 ```{r save-glmm-ldi}
@@ -385,7 +513,7 @@ cat("Saved: GLMM_LDI.csv\n")
 # Inspect Position × Bin interaction: does pre-boundary effect vary by bin?
 glmm_ldi_fac <- glmer(
   resp_similar ~ pos_pre * Condition + factor(bin) + pos_pre:factor(bin) +
-                 (1 | participant) + (1 | image_id),
+                 (1 | subject_id) + (1 | image_id),
   data    = ldi_data,
   family  = binomial(link = "logit"),
   control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
@@ -402,32 +530,53 @@ pairs(emm_ldi_bin, adjust = "tukey") %>% as_tibble() %>% arrange(bin) %>% print(
 ## 7. GLM — RT Slowing → REC Deficit (Participant-Level Regression)
 
 Replicates the OLS regression from cell 5 of the Python notebook.
-
 ```{r rt-delta}
-# Parse encoding RT per participant (median Post-RT minus median Mid-RT)
 get_rt_delta <- function(filepath) {
-  df   <- read_csv(filepath, show_col_types = FALSE)
-  main <- if ("trials.thisN" %in% names(df)) filter(df, !is.na(`trials.thisN`)) else df
+  df <- read_csv(filepath, show_col_types = FALSE,
+                 na = c("", "NA", "None", "nan", "NaN"))
+
+  main <- if ("trials.thisN" %in% names(df))
+            filter(df, !is.na(`trials.thisN`)) else df
   if (nrow(main) == 0) return(NULL)
+
   pid <- substr(basename(filepath), 1, 5)
+
   main <- main %>%
-    mutate(pos_idx = as.integer(`trials.thisN`) %% 7,
-           pos     = case_when(pos_idx == 0 ~ "post", pos_idx == 6 ~ "pre", TRUE ~ "mid"))
-  rt_candidates <- intersect(c("trials.key_resp_8.rt", "trials.key_resp_9.rt"), names(main))
+    mutate(
+      pos_idx = as.integer(`trials.thisN`) %% 7,
+      pos     = case_when(
+        pos_idx == 0 ~ "post",
+        pos_idx == 6 ~ "pre",
+        TRUE         ~ "mid"
+      )
+    )
+
+  rt_candidates <- intersect(
+    c("trials.key_resp_8.rt", "trials.key_resp_9.rt"),
+    names(main)
+  )
   if (length(rt_candidates) == 0) return(NULL)
+
+  # Keep only columns with at least one valid numeric RT
   rt_candidates <- rt_candidates[sapply(rt_candidates, function(x) {
     vals <- suppressWarnings(as.numeric(main[[x]]))
     any(!is.na(vals))
   })]
   if (length(rt_candidates) == 0) return(NULL)
+
   rt_col <- rt_candidates[1]
+
   rt_by_pos <- main %>%
     mutate(rt_value = suppressWarnings(as.numeric(.data[[rt_col]]))) %>%
     group_by(pos) %>%
     summarise(med_rt = median(rt_value, na.rm = TRUE), .groups = "drop")
+
   mid_rt  <- rt_by_pos$med_rt[rt_by_pos$pos == "mid"]
   post_rt <- rt_by_pos$med_rt[rt_by_pos$pos == "post"]
-  if (length(mid_rt) == 0 || length(post_rt) == 0) return(NULL)
+
+  if (length(mid_rt) == 0 || length(post_rt) == 0 ||
+      is.na(mid_rt) || is.na(post_rt)) return(NULL)
+
   tibble(participant = pid, rt_delta_post = post_rt - mid_rt)
 }
 
@@ -438,7 +587,6 @@ rt_data <- bind_rows(lapply(task_files_rt, get_rt_delta))
 ```
 
 ```{r rec-agg}
-# Compute foil-corrected REC delta (Post − Mid) per participant
 foil_far_df <- test_trials %>%
   filter(img_type == "Foil") %>%
   group_by(participant) %>%
@@ -451,24 +599,43 @@ rec_agg <- test_trials %>%
   pivot_wider(names_from = position, values_from = hit_rate) %>%
   left_join(foil_far_df, by = "participant") %>%
   mutate(
-    REC_post  = post - foil_far,
-    REC_mid   = mid  - foil_far,
+    REC_post       = post - foil_far,
+    REC_mid        = mid  - foil_far,
     REC_delta_post = REC_post - REC_mid
   ) %>%
-  select(participant, REC_delta_post)
+  left_join(distinct(task_info, participant, group), by = "participant") %>%
+  mutate(subject_id = paste0(group, "_", participant)) %>%
+  select(participant, group, subject_id, REC_delta_post)
 ```
 
 ```{r glm-rt-rec}
-reg_data <- rt_data %>%
-  inner_join(rec_agg, by = "participant") %>%
+rt_data_grp <- rt_data %>%
   left_join(distinct(task_info, participant, group), by = "participant") %>%
-  drop_na(rt_delta_post, REC_delta_post)
+  mutate(subject_id = paste0(group, "_", participant))
 
+reg_data <- rt_data_grp %>%
+  inner_join(rec_agg, by = "subject_id") %>%
+  select(subject_id,
+         participant = participant.x,
+         group       = group.x,
+         rt_delta_post,
+         REC_delta_post) %>%
+  drop_na(rt_delta_post, REC_delta_post) %>%
+  # ── FIX: collapse duplicate rows by averaging ──────────────────────────
+  group_by(subject_id, participant, group) %>%
+  summarise(
+    rt_delta_post  = mean(rt_delta_post,  na.rm = TRUE),
+    REC_delta_post = mean(REC_delta_post, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Verify: should now be exactly 1 row per subject ───────────────────────
 cat("N for regression:", nrow(reg_data), "\n")
 
 glm_rt <- lm(REC_delta_post ~ rt_delta_post + factor(group), data = reg_data)
 summary(glm_rt)
 ```
+
 
 ```{r glm-rt-table}
 # Full table with beta, SE, t, p, 95% CI
@@ -481,6 +648,126 @@ model_parameters(glm_rt, ci = 0.95) %>% print()
 ct <- cor.test(reg_data$rt_delta_post, reg_data$REC_delta_post)
 cat(sprintf("\nOverall Pearson r (RT slowing vs REC deficit): r=%.3f, p=%.3f\n", ct$estimate, ct$p.value))
 cat("95% CI: [", round(ct$conf.int, 3), ",", round(ct$conf.int, 3), "]\n")[2][1]
+```
+
+```{r glm-assumption1-linearity}
+library(tidyverse); library(ggplot2); library(car); library(lmtest); library(sandwich)
+
+# Linearity: scatter + LOESS vs linear
+ggplot(reg_data, aes(x = rt_delta_post, y = REC_delta_post)) +
+  geom_point(alpha = 0.5, colour = "#4C8BE0") +
+  geom_smooth(method = "lm",    se = TRUE,  colour = "#E04C4C",
+              linetype = "solid",  linewidth = 1) +
+  geom_smooth(method = "loess", se = FALSE, colour = "#4CBE8B",
+              linetype = "dashed", linewidth = 1) +
+  labs(title    = "Assumption 1: Linearity",
+       subtitle = "Red = linear fit | Green dashed = LOESS\nShould overlap if relationship is linear",
+       x = "Δ RT (Post − Mid, s)", y = "Δ REC (Post − Mid, corrected)") +
+  theme_minimal(base_size = 13)
+```
+
+```{r glm-assumption1b-residuals-vs-fitted}
+# Residuals vs Fitted — formal linearity check
+ggplot(data.frame(fitted    = fitted(glm_rt),
+                  residuals = residuals(glm_rt)),
+       aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.5, colour = "#4C8BE0") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "#E04C4C") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#4CBE8B", linewidth = 1) +
+  labs(title    = "Assumption 1b: Residuals vs Fitted",
+       subtitle = "LOESS should be flat around 0 — any curve = nonlinearity",
+       x = "Fitted Values", y = "Residuals") +
+  theme_minimal(base_size = 13)
+```
+
+```{r glm-assumption2-independence}
+# Independence: Durbin-Watson
+dw <- dwtest(glm_rt)
+print(dw)
+cat(sprintf("DW statistic = %.3f (ideal ≈ 2.0)\n", dw$statistic))
+cat(if (dw$p.value > 0.05) "No autocorrelation\n" else "Autocorrelation detected\n")
+```
+
+```{r glm-assumption3a-qq}
+# Normality: Q-Q plot
+
+ggplot(data.frame(resid = residuals(glm_rt)), aes(sample = resid)) +
+  stat_qq(colour = "#7B4CE0", alpha = 0.7) +
+  stat_qq_line(colour = "#E04C4C", linewidth = 1) +
+  labs(title    = "Assumption 3: Residual Normality (Q-Q)",
+       subtitle = "Points should hug the red diagonal",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal(base_size = 13)
+```
+
+```{r glm-assumption3b-histogram}
+# Normality: Histogram
+ggplot(data.frame(resid = residuals(glm_rt)), aes(x = resid)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 20,
+                 fill = "#7B4CE0", colour = "white", alpha = 0.8) +
+  geom_density(colour = "#E04C4C", linewidth = 1) +
+  stat_function(fun  = dnorm,
+                args = list(mean = mean(residuals(glm_rt)),
+                            sd   = sd(residuals(glm_rt))),
+                linetype = "dashed", colour = "black", linewidth = 0.9) +
+  labs(title    = "Assumption 3: Residual Distribution",
+       subtitle = "Dashed = Normal reference",
+       x = "Residual", y = "Density") +
+  theme_minimal(base_size = 13)
+```
+
+```{r glm-assumption4-homoscedasticity}
+# Homoscedasticity: Breusch-Pagan + NCV
+bp <- bptest(glm_rt)
+print(bp)
+cat(if (bp$p.value > 0.05) "Homoscedastic\n" else "Heteroscedasticity — consider robust SEs\n")
+
+cat("\n--- NCV Test ---\n")
+ncvTest(glm_rt)
+```
+
+```{r glm-assumption5-multicollinearity}
+# Multicollinearity: VIF
+vif_vals <- vif(glm_rt)
+print(vif_vals)
+cat(if (all(vif_vals < 5)) "No multicollinearity (all VIF < 5)\n" else "High VIF\n")
+
+# RT delta means by group — check predictor-group independence
+reg_data %>%
+  group_by(group) %>%
+  summarise(mean_rt = mean(rt_delta_post, na.rm = TRUE),
+            sd_rt   = sd(rt_delta_post,   na.rm = TRUE),
+            n = n())
+```
+
+```{r glm-assumption6-cooks}
+# Step 1: Check actual Cook's D values — are any > 0.5?
+cooksd <- cooks.distance(glm_rt)
+cat("Max Cook's D:", round(max(cooksd), 4), "\n")
+cat("Any Cook's D > 0.5?", any(cooksd > 0.5), "\n")
+cat("Any Cook's D > 1.0?", any(cooksd > 1.0), "\n")
+
+# Step 2: does removing them change conclusion?
+reg_data_no_inf <- reg_data %>%
+  mutate(cooksd = cooksd) %>%
+  filter(cooksd <= 4/nrow(reg_data))
+
+glm_rt_sens <- lm(REC_delta_post ~ rt_delta_post + factor(group),
+                  data = reg_data_no_inf)
+
+cat("\n--- Original result ---\n")
+cat(sprintf("rt_delta_post: β=%.4f, p=%.4f\n",
+    coef(glm_rt)["rt_delta_post"],
+    summary(glm_rt)$coef["rt_delta_post", 4]))
+
+cat("\n--- Without influential points ---\n")
+cat(sprintf("rt_delta_post: β=%.4f, p=%.4f\n",
+    coef(glm_rt_sens)["rt_delta_post"],
+    summary(glm_rt_sens)$coef["rt_delta_post", 4]))
+
+cat("\nConclusion stable?",
+    if (summary(glm_rt_sens)$coef["rt_delta_post", 4] > 0.05)
+    "YES null result holds" else "NO — influential points matter")
 ```
 
 ```{r save-rt-rec}
